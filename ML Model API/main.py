@@ -1,54 +1,92 @@
-import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
-import io
+from flask import Flask, request, jsonify
 import tensorflow as tf
-import keras
 import numpy as np
 from PIL import Image
-from flask import Flask, request, jsonify
+import io
+import logging
+from google.cloud import firestore
 
-# Load the pre-trained model for image classification
-model = keras.models.load_model("model.h5", compile=False)
-
-# Initialize Flask app
 app = Flask(__name__)
 
-# Function to predict label for the given image
+@app.route('/healthz')
+def health_check():
+    return 'OK', 200
 
-# Route to handle image prediction requests
-@app.route("/predict", methods=["GET", "POST"])
-def index():
-    file = request.files.get('file')
-    if file is None or file.filename == "":
-        return jsonify({"error": "no file"})
+logging.basicConfig(level=logging.INFO)
 
+try:
+    model = tf.saved_model.load("gs://ml-model-storage-bucket/modelfix/")
+    infer = model.signatures["serving_default"]
+except Exception as e:
+    logging.error("Error loading TensorFlow model: %s", e)
+    raise
+
+class_names = [
+   'Adem Sari', 'aqua', 'bear brand', 'cimory', 'coca cola', 'fanta', 'frestea', 'fruit tea', 'golda', 'good day', 'gunung', 'ichitan green tea', 'le minerale', 'milo', 'pocari', 'pulpy', 's tee', 'sprite', 'teh botol', 'teh gelas', 'teh kotak', 'teh pucuk', 'ultra milk moka'
+]
+
+try:
+    db = firestore.Client()
+except Exception as e:
+    logging.error("Error initializing Firestore client: %s", e)
+    raise
+
+data_augmentation = tf.keras.Sequential([
+   tf.keras.layers.RandomFlip('horizontal'),
+   tf.keras.layers.RandomRotation(0.2),
+])
+
+preprocess_input = tf.keras.applications.efficientnet_v2.preprocess_input
+
+def preprocess_image(image):
     try:
-        image_bytes = file.read()
-        img = Image.open(io.BytesIO(image_bytes))
-        img = img.resize((224, 224), Image.NEAREST)
-        img = img.convert('RGB')
-        data = np.asarray(img)
-
-        data = data / 255.0
-        data = data.reshape(1, 224, 224, 3)
-        prediction = model.predict(data)
-
-        # Get the class names from the model
-        class_names = [layer.name for layer in model.layers if layer.name.startswith('class_output')][0].weights[0].numpy()
-        class_names = [class_name.decode('utf-8') for class_name in class_names]
-
-        # Convert numpy array to Python list
-        prediction = prediction.tolist()
-
-        # Get the top-1 prediction and its corresponding class name
-        top_prediction = np.argmax(prediction[0])
-        top_class_name = class_names[top_prediction]
-
-        data = {"prediction": prediction, "class_names": class_names, "top_class_name": top_class_name}
-        return jsonify(data)
+        img = Image.open(io.BytesIO(image))
+        img = img.resize((224, 224))
+        img = np.array(img)
+        img = tf.expand_dims(img, axis=0)
+        img = data_augmentation(img)
+        img = preprocess_input(img)
+        return img
     except Exception as e:
-        return jsonify({"error": str(e)})
+        logging.error("Error preprocessing image: %s", e)
+        raise
 
-if __name__=="__main__":
-    app.run(debug=True)
+@app.route('/predict', methods=['POST'])
+def predict():
+    if 'file' not in request.files:
+        return "No file part", 400
+    file = request.files['file']
+    if file.filename == '':
+        return "No selected file", 400
+    try:
+        image = file.read()
+        input_image = preprocess_image(image)
+        predictions = infer(tf.constant(input_image))
+        output_tensor_name = list(predictions.keys())[0]
+        output_tensor = predictions[output_tensor_name].numpy()
+
+        predicted_class_indices = np.argmax(output_tensor, axis=1)
+        predicted_class = class_names[predicted_class_indices[0]]
+        confidence_score = np.max(output_tensor, axis=1)[0]
+
+        class_details_ref = db.collection('classDetails').document(predicted_class)
+        class_details = class_details_ref.get().to_dict()
+
+        if class_details is None:
+            return jsonify({'error': 'Class details not found'}), 404
+        
+        gula_content = class_details.get('gula', 'N/A')
+        warning_health = class_details.get('peringatan', 'N/A')
+
+        response = {
+            'jenis minuman': predicted_class,
+            'kandungan gula': gula_content,
+            'peringatan kesehatan': warning_health
+        }
+        return jsonify(response)
+    except Exception as e:
+        logging.error("Error processing prediction: %s", e)
+        return "Internal Server Error", 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080, debug=True)
